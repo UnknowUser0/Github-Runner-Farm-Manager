@@ -252,13 +252,11 @@ The standard bootstrap installs completion automatically.
 
 ## `uninstall <target>`
 
-Remove one farm:
+Remove one farm without removing the manager, global authentication, or other farms:
 
 ```bash
 runner-farmctl uninstall <target>
 ```
-
-The manager and authentication remain installed.
 
 Remove its configured local worker image too:
 
@@ -272,15 +270,48 @@ Force removal is reserved for cases where active work may be interrupted:
 runner-farmctl uninstall <target> --force
 ```
 
-## `self-uninstall`
+## `uninstall --all`
+
+Remove every installed farm while keeping `runner-farmctl` and the saved manager authentication:
+
+```bash
+runner-farmctl uninstall --all
+```
+
+Remove configured worker images at the same time:
+
+```bash
+runner-farmctl uninstall --all --purge-image
+```
+
+The manager remains ready for another `runner-farmctl install <repo/org>` afterward.
+
+## `manager-uninstall`
 
 Remove `runner-farmctl` itself:
 
 ```bash
-runner-farmctl self-uninstall
+runner-farmctl manager-uninstall
 ```
 
-All farms must be removed first.
+All farms must be removed first. If farms still exist, the command exits with an instruction to run:
+
+```bash
+runner-farmctl uninstall --all
+```
+
+The command removes the manager binary, supervisor, systemd template, completion files, runtime data, target configuration directory, and manager authentication file.
+
+It does not uninstall the system GitHub CLI package or remove GitHub CLI's own login state, because those may be used independently of Runner Farm Manager.
+
+If local worker images should be removed too, run:
+
+```bash
+runner-farmctl uninstall --all --purge-image
+runner-farmctl manager-uninstall
+```
+
+`runner-farmctl self-uninstall` remains available as a deprecated compatibility alias.
 
 ## `version`
 
