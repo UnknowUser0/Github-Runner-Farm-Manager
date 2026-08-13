@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="SkyTeamExec/Github-Runner-Farm-Manager"
+REPO="${RUNNER_FARM_REPO:-SkyTeamExec/Github-Runner-Farm-Manager}"
 BRANCH="${RUNNER_FARM_REF:-main}"
 BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 CLI_URL="${BASE_URL}/runner-farmctl"
