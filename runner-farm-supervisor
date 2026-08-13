@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+BASE_DIR="/etc/github-runner-farm"
+TARGETS_DIR="${BASE_DIR}/targets"
+AUTH_FILE="${BASE_DIR}/auth.env"
+API_VERSION="2026-03-10"
+
+log() { printf '[runner-farm:%s] %s\n' "${INSTANCE_ID:-unknown}" "$*"; }
+warn() { printf '[runner-farm:%s] WARNING: %s\n' "${INSTANCE_ID:-unknown}" "$*" >&2; }
+
+load_instance() {
+  local id="$1" cfg="${TARGETS_DIR}/${id}.env"
+  [[ -f "$cfg" ]] || { echo "Target config not found: $cfg" >&2; exit 2; }
+  source "$cfg"
+  INSTANCE_ID="$id"
+}
+
+get_token() {
+  [[ -f "$AUTH_FILE" ]] || return 1
+  source "$AUTH_FILE"
+  case "${AUTH_METHOD:-}" in
+    pat) [[ -n "${GITHUB_PAT:-}" ]] || return 1; printf '%s' "$GITHUB_PAT" ;;
+    gh) GH_CONFIG_DIR=/root/.config/gh gh auth token --hostname github.com 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+github_json() { local t; t="$(get_token)" || return 1; curl -fsSL -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $t" -H "X-GitHub-Api-Version: $API_VERSION" "$1"; }
+github_delete_runner() { local t; t="$(get_token)" || return 1; curl -fsSL -X DELETE -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $t" -H "X-GitHub-Api-Version: $API_VERSION" "$RUNNERS_ENDPOINT/$1" >/dev/null; }
+registration_token() { local t b; t="$(get_token)" || return 1; b="$(curl -fsSL -X POST -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $t" -H "X-GitHub-Api-Version: $API_VERSION" "$REGISTRATION_ENDPOINT")"; jq -r '.token // empty' <<<"$b"; }
+refresh_download_url() { local t b; t="$(get_token)" || return 1; b="$(curl -fsSL -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $t" -H "X-GitHub-Api-Version: $API_VERSION" "$DOWNLOADS_ENDPOINT")" || return 1; jq -r '.[] | select(.os=="linux" and .architecture=="x64") | .download_url' <<<"$b" | head -n1; }
+
+all_github_farm_runners() {
+  local page=1 body
+  while :; do
+    body="$(github_json "${RUNNERS_ENDPOINT}?per_page=100&page=${page}")" || return 1
+    jq -r --arg p "${RUNNER_PREFIX}-" '.runners[]? | select(.name | startswith($p)) | [.id,.name,.status,.busy] | @tsv' <<<"$body"
+    [[ "$(jq '.runners | length' <<<"$body")" -lt 100 ]] && break
+    ((page+=1))
+  done
+}
+
+local_container_for_runner() { docker ps -q --filter "label=grfm.managed=true" --filter "label=grfm.instance=$INSTANCE_ID" --filter "label=grfm.runner-name=$1" | head -n1; }
+container_started_epoch() { docker inspect -f '{{index .Config.Labels "grfm.started-at"}}' "$1" 2>/dev/null || printf 0; }
+
+sync_github() {
+  local rid name status busy cid started now age removed=0 replaced=0
+  now="$(date +%s)"
+  while IFS=$'\t' read -r rid name status busy; do
+    [[ -n "$rid" ]] || continue
+    cid="$(local_container_for_runner "$name")"
+    if [[ -z "$cid" ]]; then
+      log "Removing stale GitHub registration with no local worker: $name ($status)"
+      github_delete_runner "$rid" || warn "Failed to delete $name"
+      ((removed+=1))
+      continue
+    fi
+    if [[ "$status" == offline ]]; then
+      started="$(container_started_epoch "$cid")"; [[ "$started" =~ ^[0-9]+$ ]] || started=0; age=$((now-started))
+      if (( age >= OFFLINE_GRACE_SECONDS )); then
+        log "Replacing offline runner after ${age}s: $name"
+        github_delete_runner "$rid" || true
+        docker rm -f "$cid" >/dev/null 2>&1 || true
+        ((removed+=1)); ((replaced+=1))
+      fi
+    fi
+  done < <(all_github_farm_runners || true)
+  log "GitHub sync complete: stale_removed=$removed offline_replaced=$replaced"
+}
+
+runner_state_by_name() { local wanted="$1" rid name status busy; while IFS=$'\t' read -r rid name status busy; do [[ "$name" == "$wanted" ]] || continue; printf '%s\t%s\t%s' "$rid" "$status" "$busy"; return 0; done < <(all_github_farm_runners || true); return 1; }
+cleanup_exited() { docker ps -aq --filter "label=grfm.managed=true" --filter "label=grfm.instance=$INSTANCE_ID" --filter status=exited | xargs -r docker rm -f >/dev/null 2>&1 || true; }
+containers_for_slot() { docker ps -q --filter "label=grfm.managed=true" --filter "label=grfm.instance=$INSTANCE_ID" --filter "label=grfm.slot=$1"; }
+
+stop_container_if_idle() {
+  local cid="$1" name state rid status busy
+  name="$(docker inspect -f '{{index .Config.Labels "grfm.runner-name"}}' "$cid" 2>/dev/null || true)"
+  [[ -n "$name" ]] || { docker rm -f "$cid" >/dev/null 2>&1 || true; return; }
+  state="$(runner_state_by_name "$name" || true)"
+  [[ -n "$state" ]] || { docker rm -f "$cid" >/dev/null 2>&1 || true; return; }
+  IFS=$'\t' read -r rid status busy <<<"$state"
+  [[ "$busy" == true ]] && { log "Draining busy excess runner: $name"; return; }
+  log "Stopping idle excess runner: $name"
+  github_delete_runner "$rid" || true
+  docker rm -f "$cid" >/dev/null 2>&1 || true
+}
+
+spawn_slot() {
+  local slot="$1" reg runner container now download total
+  reg="$(registration_token)" || { warn "Failed to get registration token for slot $slot"; return 1; }
+  [[ -n "$reg" ]] || return 1
+  download="$(refresh_download_url 2>/dev/null || true)"; [[ -n "$download" ]] || download="$RUNNER_DOWNLOAD_URL"
+  now="$(date +%s)"; runner="${RUNNER_PREFIX}-s${slot}-${now}-${RANDOM}"; container="grfm-${INSTANCE_ID}-s${slot}-${now}-${RANDOM}"
+  local args=(run -d --privileged --name "$container" --label grfm.managed=true --label "grfm.instance=$INSTANCE_ID" --label "grfm.slot=$slot" --label "grfm.runner-name=$runner" --label "grfm.started-at=$now" --pids-limit "$RUNNER_PIDS_LIMIT" --shm-size "$RUNNER_SHM_SIZE" -e "GITHUB_URL=$GITHUB_URL" -e "REGISTRATION_TOKEN=$reg" -e "RUNNER_NAME=$runner" -e "RUNNER_LABELS=$RUNNER_LABELS" -e "RUNNER_DOWNLOAD_URL=$download" -e "DOCKER_STORAGE_DRIVER=$DOCKER_STORAGE_DRIVER")
+  [[ -n "${RUNNER_CPU:-}" ]] && args+=(--cpus "$RUNNER_CPU")
+  if [[ -n "${RUNNER_MEMORY_BYTES:-}" ]]; then total=$((RUNNER_MEMORY_BYTES + ${RUNNER_SWAP_BYTES:-0})); args+=(--memory "${RUNNER_MEMORY_BYTES}b" --memory-swap "${total}b"); fi
+  args+=("$IMAGE_NAME")
+  docker "${args[@]}" >/dev/null && log "Spawned slot $slot as $runner"
+}
+
+reconcile_local() {
+  cleanup_exited
+  local slot cid first
+  local -a cids
+  for ((slot=1; slot<=RUNNER_MAX_SLOTS; slot++)); do
+    mapfile -t cids < <(containers_for_slot "$slot")
+    if (( slot <= RUNNER_COUNT )); then
+      if ((${#cids[@]}==0)); then spawn_slot "$slot" || true
+      elif ((${#cids[@]}>1)); then first=1; for cid in "${cids[@]}"; do ((first==1)) && { first=0; continue; }; stop_container_if_idle "$cid"; done
+      fi
+    else
+      for cid in "${cids[@]}"; do stop_container_if_idle "$cid"; done
+    fi
+  done
+}
+
+purge_github() {
+  local force="$1" rid name status busy
+  while IFS=$'\t' read -r rid name status busy; do
+    [[ -n "$rid" ]] || continue
+    if [[ "$busy" == true && "$force" != true ]]; then echo "Busy runner prevents removal: $name" >&2; exit 3; fi
+    github_delete_runner "$rid" || true
+  done < <(all_github_farm_runners || true)
+}
+
+run_loop() {
+  trap 'true' USR1
+  trap 'exit 0' TERM INT
+  local last=0 now
+  log "Supervisor started for $TARGET_KEY; desired=$RUNNER_COUNT"
+  while :; do
+    source "$TARGETS_DIR/$INSTANCE_ID.env"
+    reconcile_local
+    now="$(date +%s)"
+    if (( now-last >= GITHUB_SYNC_INTERVAL )); then sync_github || true; last="$now"; fi
+    sleep "$RECONCILE_INTERVAL" & wait $! || true
+  done
+}
+
+main() {
+  case "${1:-}" in
+    --sync-once) load_instance "${2:?instance required}"; sync_github ;;
+    --purge-github) load_instance "${2:?instance required}"; purge_github "${3:-false}" ;;
+    "") echo "Usage: $0 <instance>" >&2; exit 2 ;;
+    *) load_instance "$1"; run_loop ;;
+  esac
+}
+main "$@"
