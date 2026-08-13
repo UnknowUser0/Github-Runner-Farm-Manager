@@ -24,6 +24,9 @@ curl -fsSL "$URL" -o "$TMP"
 chmod 0755 "$TMP"
 $SUDO install -m 0755 "$TMP" "$DEST"
 
+# Install shell completion definitions for Bash, Zsh, and Fish.
+"$DEST" completion install
+
 printf '%s\n' "Installed: $DEST"
 "$DEST" version
-printf '\nNext step:\n  runner-farmctl install <repo/org>\n\nExamples:\n  runner-farmctl install SkyTeamExec/Github-Runner-Farm-Manager\n  runner-farmctl install SkyTeamExec\n'
+printf '\nOpen the TUI:\n  runner-farmctl\n\nInstall a farm:\n  runner-farmctl install <repo/org>\n\nExamples:\n  runner-farmctl install SkyTeamExec/Github-Runner-Farm-Manager\n  runner-farmctl install SkyTeamExec\n'
