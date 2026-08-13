@@ -29,4 +29,4 @@ $SUDO install -m 0755 "$TMP" "$DEST"
 
 printf '%s\n' "Installed: $DEST"
 "$DEST" version
-printf '\nOpen the TUI:\n  runner-farmctl\n\nInstall a farm:\n  runner-farmctl install <repo/org>\n\nExamples:\n  runner-farmctl install SkyTeamExec/Github-Runner-Farm-Manager\n  runner-farmctl install SkyTeamExec\n'
+printf '\nOpen the TUI:\n  runner-farmctl\n\nInstall a farm:\n  runner-farmctl install <repo/org>\n\nExamples:\n  runner-farmctl install SkyTeamExec/Github-Runner-Farm-Manager\n  runner-farmctl install SkyTeamExec\n\nRemove one farm:\n  runner-farmctl uninstall <farm>\n\nRemove all farms but keep the manager:\n  runner-farmctl uninstall --all\n\nUninstall runner-farmctl itself (after farms are removed):\n  runner-farmctl manager-uninstall\n'
