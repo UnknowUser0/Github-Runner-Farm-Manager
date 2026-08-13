@@ -1,251 +1,382 @@
 # GitHub Runner Farm Manager
 
-GitHub Runner Farm Manager membuat sekumpulan **ephemeral self-hosted GitHub Actions runners** di satu mesin Ubuntu. Setiap runner berjalan di container disposable sendiri, memiliki Docker daemon sendiri, filesystem/workspace/cache sendiri, dan hanya menerima satu job sebelum dihancurkan.
+GitHub Runner Farm Manager manages multiple **ephemeral self-hosted GitHub Actions runner farms** on one Ubuntu host.
 
-**Current version:** `v1.0.0`
+Each repository or organization is managed as an independent farm with its own:
 
-**Universal worker image:** `ghcr.io/skyteamexec/github-runner-farm-manager:v1.0.0`
+- desired runner count;
+- systemd service;
+- container namespace;
+- GitHub runner prefix;
+- CPU/RAM/swap policy;
+- labels;
+- reconciliation loop.
 
-## Fitur v1.0.0
+Authentication is stored once on the host and reused for every farm.
 
-- Auto-detect target GitHub repository atau organization dari URL.
-- Login menggunakan browser/device flow melalui `gh auth login --web`, atau PAT.
-- Default 4 runner, dapat di-scale live hingga `RUNNER_MAX_SLOTS`.
-- Scale-up aktif direconcile dan diverifikasi; tidak perlu restart service.
-- Scale-down menghentikan runner idle berlebih dan membiarkan runner busy menyelesaikan job.
-- CPU/RAM default **tanpa limit Docker**: setiap runner dapat memakai resource host penuh.
-- Optional per-runner CPU/RAM limits.
-- Runner ephemeral: satu job lalu container dibuang dan dibuat baru.
-- Docker-in-Docker per runner; tidak membagikan `/var/run/docker.sock` host.
-- Worker image dibangun di GitHub Actions dan dipublish ke GHCR; installer tidak membangun image lokal.
-- Image dan manager memiliki versi SemVer.
-- Fokus v1: Ubuntu Linux `amd64`.
+## Versions
 
-## Instalasi
-
-```bash
-curl -fsSL \
-  https://raw.githubusercontent.com/SkyTeamExec/Github-Runner-Farm-Manager/main/install.sh \
-  -o install.sh
-
-chmod +x install.sh
-sudo ./install.sh
-```
-
-Installer akan meminta:
-
-1. GitHub URL repository/organization.
-2. Authentication method: `web` atau `pat`.
-
-Contoh target repository:
+Manager/CLI and worker image versions are intentionally independent:
 
 ```text
-https://github.com/OWNER/REPOSITORY
+VERSION        -> runner-farmctl / manager version
+IMAGE_VERSION  -> GHCR universal worker image version
 ```
 
-Contoh organization:
+Current initial release:
 
 ```text
-https://github.com/ORGANIZATION
+Manager: v1.0.0
+Image  : v1.0.0
 ```
 
-atau:
-
-```text
-https://github.com/organizations/ORGANIZATION
-```
-
-Scope `repo`/`org` tidak perlu dipilih manual.
-
-## Login browser/device
-
-Default authentication adalah:
-
-```text
-web
-```
-
-Installer memasang GitHub CLI bila belum tersedia dan menjalankan web/device authentication. Pada server headless, GitHub CLI akan menampilkan URL/kode autentikasi yang dapat dibuka dari browser perangkat lain.
-
-PAT masih tersedia dengan memilih:
-
-```text
-pat
-```
-
-Untuk mode non-interaktif:
-
-```bash
-sudo env \
-  GITHUB_URL=https://github.com/OWNER/REPOSITORY \
-  GITHUB_PAT=YOUR_TOKEN \
-  RUNNER_COUNT=4 \
-  ./install.sh
-```
-
-## Resource default
-
-v1.0.0 **tidak memberikan `--cpus`, `--memory`, atau `--memory-swap` ke worker secara default**.
-
-Jadi pada mesin 16 CPU / 64 GB RAM, masing-masing runner secara teknis dapat menggunakan sampai resource yang tersedia pada host. Ini bukan reservation 16 CPU + 64 GB per runner; semua runner tetap bersaing menggunakan scheduler/kernel host yang sama.
-
-Cek:
-
-```bash
-sudo runner-farmctl status
-```
-
-Output resource default:
-
-```text
-Resources       : host/unlimited
-```
-
-Untuk memasang limit:
-
-```bash
-sudo runner-farmctl limits 2 4g 4g
-```
-
-Kembali ke host/unlimited:
-
-```bash
-sudo runner-farmctl limits host
-```
-
-Limit baru berlaku pada worker ephemeral berikutnya dan tidak memutus worker yang sedang menjalankan job.
-
-## Scaling
-
-Scale ke 8:
-
-```bash
-sudo runner-farmctl scale 8
-```
-
-Scale ke 2:
-
-```bash
-sudo runner-farmctl scale 2
-```
-
-### Scale-up
-
-Supervisor membaca desired state dan membuat slot yang belum ada. `runner-farmctl scale` kemudian menunggu dan memverifikasi live slot agar kegagalan spawn tidak diam-diam dianggap sukses.
-
-### Scale-down
-
-- Runner berlebih yang idle: dihentikan dan deregister segera.
-- Runner berlebih yang busy: dibiarkan menyelesaikan workflow lalu tidak respawn.
-
-Paksa sinkronisasi:
-
-```bash
-sudo runner-farmctl reconcile
-```
-
-## Image GHCR
-
-Image universal dibangun dari:
-
-```text
-docker/Dockerfile
-```
-
-Workflow:
-
-```text
-.github/workflows/build-runner-image.yml
-```
-
-Tags v1.0.0:
+Default image:
 
 ```text
 ghcr.io/skyteamexec/github-runner-farm-manager:v1.0.0
-ghcr.io/skyteamexec/github-runner-farm-manager:v1
-ghcr.io/skyteamexec/github-runner-farm-manager:latest
-ghcr.io/skyteamexec/github-runner-farm-manager:sha-...
 ```
 
-Installer v1.0.0 menggunakan tag versioned `v1.0.0`, bukan `latest`.
+A manager-only change does not require rebuilding the worker image.
 
-Pull ulang image:
+## Install the manager
 
 ```bash
-sudo runner-farmctl image-pull
+curl -fsSL https://raw.githubusercontent.com/SkyTeamExec/Github-Runner-Farm-Manager/main/install.sh | sh
 ```
 
-## Toolchain universal Ubuntu
-
-Image v1 menyertakan toolchain umum CI/CD dalam satu image:
-
-- Docker Engine, Compose v2, Buildx
-- Git, Git LFS, GitHub CLI
-- Java 17 dan Java 21
-- Maven dan Gradle
-- Node.js 24 LTS, npm, pnpm, Yarn/Corepack
-- Bun dan Deno
-- Python 3, pip, pipx
-- Go stable
-- Rust stable, Cargo, rustfmt, Clippy
-- .NET 10 LTS
-- PHP dan Composer
-- Ruby dan Bundler
-- GCC/G++, Clang/LLVM, CMake, Ninja, Meson
-- Android command-line SDK, platform-tools/ADB, API 36, Build Tools 36.0.0
-- PostgreSQL, MySQL, Redis clients
-- kubectl, Helm, Terraform, AWS CLI v2, yq
-- Google Chrome stable
-- ffmpeg, ImageMagick, protobuf compiler, ShellCheck dan utility Linux umum
-
-GitHub Actions runner binary terbaru dibake saat image dibangun. Installer juga mengambil URL binary yang tersedia untuk target repository/organization; jika GitHub progressive rollout memberikan versi berbeda, entrypoint worker mengambil versi target tersebut saat container dimulai.
-
-## Workflow
-
-```yaml
-jobs:
-  build:
-    runs-on: [self-hosted, universal]
-
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - run: node --version
-      - run: java -version
-      - run: docker version
-```
-
-Labels default:
+The bootstrap installs:
 
 ```text
-universal,docker,java,node,python,go,rust,dotnet,android,ubuntu
+/usr/local/bin/runner-farmctl
 ```
 
-## Uninstall
+and Bash, Zsh, and Fish command completion definitions.
 
-Normal:
+It does **not** create a GitHub runner farm yet.
+
+Open the TUI:
 
 ```bash
-sudo runner-farmctl uninstall
+runner-farmctl
 ```
 
-Hapus image juga:
+Or install directly from the CLI:
 
 ```bash
-sudo runner-farmctl uninstall --purge-image
+runner-farmctl install SkyTeamExec/Github-Runner-Farm-Manager
 ```
 
-Memutus job busy secara paksa:
+Organization example:
 
 ```bash
-sudo runner-farmctl uninstall --force
+runner-farmctl install SkyTeamExec
 ```
 
-`--force` sebaiknya hanya digunakan ketika workflow aktif memang boleh dihentikan.
+URLs are also accepted:
 
-## Dokumentasi command
+```bash
+runner-farmctl install https://github.com/OWNER/REPOSITORY
+runner-farmctl install https://github.com/ORGANIZATION
+```
 
-Lihat [`docs/runner-farmctl.md`](docs/runner-farmctl.md).
+## Authentication
+
+The first farm installation asks for one of:
+
+```text
+1. GitHub browser/device login
+2. Personal Access Token (PAT)
+```
+
+Authentication is stored globally for this host and reused when additional repositories or organizations are installed.
+
+Manage authentication explicitly:
+
+```bash
+runner-farmctl auth status
+runner-farmctl auth login
+runner-farmctl auth pat
+runner-farmctl auth logout
+```
+
+Browser/device login uses GitHub CLI. PAT mode stores the token in:
+
+```text
+/etc/github-runner-farm/auth.env
+```
+
+with root-only permissions.
+
+## Multiple repositories and organizations
+
+One host can manage multiple targets at the same time:
+
+```bash
+runner-farmctl install UnknowUser0/Sky-Music
+runner-farmctl install UnknowUser0/Backend-w4g
+runner-farmctl install SkyTeamExec
+```
+
+List all installed farms:
+
+```bash
+runner-farmctl list
+```
+
+Each target receives a unique instance ID and a dedicated systemd service:
+
+```text
+github-runner-farm@<instance>.service
+```
+
+Target configs are stored separately:
+
+```text
+/etc/github-runner-farm/targets/<instance>.env
+```
+
+## TUI
+
+Run the command without arguments:
+
+```bash
+runner-farmctl
+```
+
+The TUI can:
+
+- list installed farms;
+- install another repository or organization;
+- inspect status;
+- scale a farm;
+- change CPU/RAM/swap settings;
+- synchronize GitHub registrations;
+- reconcile local workers;
+- show logs;
+- start/stop/restart a farm;
+- remove a farm;
+- inspect authentication.
+
+The normal CLI remains available for scripting and users who prefer commands.
+
+## Shell completion
+
+The bootstrap installs completion for:
+
+- Bash;
+- Zsh;
+- Fish.
+
+It completes subcommands and installed farm instance IDs.
+
+Reinstall completion files manually:
+
+```bash
+runner-farmctl completion install
+```
+
+## Runner resources
+
+The default resource mode is:
+
+```text
+host/unlimited
+```
+
+No Docker `--cpus`, `--memory`, or `--memory-swap` limits are applied. Each runner may use the resources currently available on the host. Resources are shared between concurrent runners; they are not exclusively reserved.
+
+During custom configuration, the manager displays:
+
+- physical cores;
+- logical CPUs/threads;
+- RAM;
+- swap.
+
+CPU validation uses unique Linux `SOCKET,CORE` pairs rather than logical SMT threads. A requested per-runner CPU value greater than the detected physical-core count is rejected.
+
+On a VM, the manager can only validate the CPU topology exposed by the hypervisor; it cannot see the physical topology of the underlying host.
+
+RAM cannot exceed host RAM, and configured swap cannot exceed host swap.
+
+Example:
+
+```bash
+runner-farmctl limits <target> 4 8G 4G
+```
+
+This becomes:
+
+```text
+--cpus 4
+--memory 8G
+--memory-swap 12G
+```
+
+`--memory-swap` is correctly calculated as RAM + swap.
+
+Return to unrestricted mode:
+
+```bash
+runner-farmctl limits <target> host
+```
+
+Resource changes apply to newly spawned ephemeral workers and do not intentionally terminate current jobs.
+
+## Scaling
+
+```bash
+runner-farmctl scale <target> 8
+runner-farmctl scale <target> 2
+```
+
+If exactly one farm is installed, the target can be omitted:
+
+```bash
+runner-farmctl scale 8
+```
+
+The supervisor is desired-state based:
+
+- missing slots are spawned automatically;
+- idle excess slots are removed during scale-down;
+- busy excess runners are drained;
+- exited ephemeral workers are removed and replaced when still desired.
+
+## GitHub runner synchronization
+
+Each farm continuously reconciles **local containers and GitHub runner registrations**.
+
+A runner registration belongs to a farm only when its name starts with that farm's unique host+target prefix.
+
+The synchronization process:
+
+- removes a farm registration that has no matching local running container;
+- removes stale `Offline` registrations;
+- replaces a local worker that stays `Offline` past the grace period;
+- prevents old registrations from accumulating when an ephemeral container crashes;
+- does not touch self-hosted runners created outside this farm prefix.
+
+Manual synchronization:
+
+```bash
+runner-farmctl sync <target>
+```
+
+Synchronize every installed farm:
+
+```bash
+runner-farmctl sync --all
+```
+
+This specifically prevents states such as an old `s2` runner remaining `Offline` while a newer `s2` runner is already active.
+
+## Universal Ubuntu worker
+
+The v1 worker image targets Ubuntu/Linux AMD64 and includes one broad toolchain image rather than separate language images.
+
+Included tooling covers:
+
+- Docker Engine, Compose v2, Buildx;
+- Git, Git LFS, GitHub CLI;
+- Java 17 and Java 21;
+- Maven and Gradle;
+- Node.js 24 LTS, npm, pnpm, Yarn/Corepack;
+- Bun and Deno;
+- Python 3, pip, pipx;
+- Go stable;
+- Rust stable, Cargo, rustfmt, Clippy;
+- .NET 10;
+- PHP and Composer;
+- Ruby and Bundler;
+- GCC/G++, Clang/LLVM, CMake, Ninja, Meson;
+- Android SDK, platform-tools/ADB, API 36, Build Tools 36.0.0;
+- PostgreSQL, MySQL, Redis clients;
+- kubectl, Helm, Terraform, AWS CLI v2, yq;
+- Google Chrome;
+- ffmpeg, ImageMagick, protobuf compiler, ShellCheck, and common Linux utilities.
+
+Each worker runs a private Docker daemon. The host Docker socket is not shared with workflow jobs.
+
+## Worker image CI
+
+The worker image workflow runs automatically only when image-related files change:
+
+```text
+IMAGE_VERSION
+docker/**
+```
+
+Changes to:
+
+```text
+README.md
+docs/**
+runner-farmctl
+runner-farm-supervisor
+install.sh
+VERSION
+```
+
+do not rebuild the large worker image.
+
+The workflow can still be started manually with `workflow_dispatch`.
+
+Published tags include:
+
+```text
+v<IMAGE_VERSION>
+v<IMAGE_MAJOR>
+latest
+sha-...
+```
+
+## Common commands
+
+```bash
+runner-farmctl
+runner-farmctl list
+runner-farmctl status
+runner-farmctl status <target>
+runner-farmctl logs <target>
+runner-farmctl scale <target> <count>
+runner-farmctl reconcile <target>
+runner-farmctl sync <target>
+runner-farmctl limits <target> host
+runner-farmctl limits <target> <cpu> <ram> [swap]
+runner-farmctl labels <target> <labels>
+runner-farmctl image-pull <target>
+runner-farmctl start <target>
+runner-farmctl stop <target>
+runner-farmctl restart <target>
+runner-farmctl config <target>
+runner-farmctl uninstall <target>
+runner-farmctl version
+```
+
+See [`docs/runner-farmctl.md`](docs/runner-farmctl.md) for the full command reference.
+
+## Remove one farm
+
+```bash
+runner-farmctl uninstall <target>
+```
+
+Remove its local image too:
+
+```bash
+runner-farmctl uninstall <target> --purge-image
+```
+
+The manager and saved authentication remain installed so another farm can be created immediately.
+
+Remove the manager itself only after all farms have been removed:
+
+```bash
+runner-farmctl self-uninstall
+```
 
 ## Security model
 
-Worker menggunakan privileged Docker-in-Docker untuk kompatibilitas Docker/Compose yang luas. Ini memberikan pemisahan workspace/cache/Docker daemon antar-runner, tetapi privileged container **bukan security boundary setara VM** terhadap workflow hostile. Jangan menjalankan arbitrary untrusted public-PR workloads tanpa boundary tambahan seperti VM/microVM per job.
+Workers use privileged Docker-in-Docker for broad Docker/Compose compatibility and strong separation of workspace, cache, and Docker state between runner containers.
+
+A privileged container is **not** a VM-grade security boundary. Do not treat this design as safe for arbitrary hostile public pull-request code without an additional VM/microVM boundary.
