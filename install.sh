@@ -5,7 +5,10 @@ REPO="${RUNNER_FARM_REPO:-SkyTeamExec/Github-Runner-Farm-Manager}"
 BRANCH="${RUNNER_FARM_REF:-main}"
 BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 CLI_URL="${BASE_URL}/runner-farmctl"
+SUPERVISOR_URL="${BASE_URL}/runner-farm-supervisor"
 DEST="/usr/local/bin/runner-farmctl"
+SUPERVISOR_DEST="/usr/local/libexec/runner-farm-supervisor"
+SERVICE_TEMPLATE="/etc/systemd/system/github-runner-farm@.service"
 
 log() { printf '[runner-farm] %s\n' "$*"; }
 die() { printf '[runner-farm] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -27,7 +30,6 @@ command -v systemctl >/dev/null 2>&1 || die "systemd is required by runner-farmc
 
 os_id() {
   if [ -r /etc/os-release ]; then
-    # shellcheck disable=SC1091
     . /etc/os-release
     printf '%s' "${ID:-unknown}"
   else
@@ -37,7 +39,6 @@ os_id() {
 
 os_like() {
   if [ -r /etc/os-release ]; then
-    # shellcheck disable=SC1091
     . /etc/os-release
     printf '%s' "${ID_LIKE:-}"
   fi
@@ -143,15 +144,46 @@ install_github_cli() {
   trap - 0 2 15
 }
 
-install_cli() {
-  tmp="$(mktemp)"
-  trap 'rm -f "$tmp"' 0 2 15
-  log "Installing runner-farmctl..."
-  curl -fsSL "$CLI_URL" -o "$tmp"
-  chmod 0755 "$tmp"
-  $SUDO install -m 0755 "$tmp" "$DEST"
-  rm -f "$tmp"
+install_manager_runtime() {
+  tmp_cli="$(mktemp)"
+  tmp_supervisor="$(mktemp)"
+  trap 'rm -f "$tmp_cli" "$tmp_supervisor"' 0 2 15
+
+  log "Installing runner-farmctl and supervisor..."
+  curl -fsSL "$CLI_URL" -o "$tmp_cli"
+  curl -fsSL "$SUPERVISOR_URL" -o "$tmp_supervisor"
+  chmod 0755 "$tmp_cli" "$tmp_supervisor"
+
+  $SUDO install -d -m 0755 /usr/local/libexec
+  $SUDO install -m 0755 "$tmp_cli" "$DEST"
+  $SUDO install -m 0755 "$tmp_supervisor" "$SUPERVISOR_DEST"
+
+  rm -f "$tmp_cli" "$tmp_supervisor"
   trap - 0 2 15
+
+  service_tmp="$(mktemp)"
+  cat > "$service_tmp" <<'EOF_SERVICE'
+[Unit]
+Description=GitHub Runner Farm (%i)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+Environment=id=%i
+ExecStart=/usr/local/libexec/runner-farm-supervisor %i
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+  $SUDO install -m 0644 "$service_tmp" "$SERVICE_TEMPLATE"
+  rm -f "$service_tmp"
+  $SUDO systemctl daemon-reload
 
   $SUDO "$DEST" completion install
 }
@@ -159,8 +191,8 @@ install_cli() {
 install_base_dependencies
 install_docker
 install_github_cli
-install_cli
+install_manager_runtime
 
 log "Bootstrap completed."
 "$DEST" version
-printf '\nHost prerequisites are ready. No farm was created.\n\nOpen the TUI:\n  runner-farmctl\n\nInstall a farm:\n  runner-farmctl install <repo/org>\n\nExamples:\n  runner-farmctl install SkyTeamExec/Github-Runner-Farm-Manager\n  runner-farmctl install SkyTeamExec\n\nRemove one farm:\n  runner-farmctl uninstall <farm>\n\nRemove all farms but keep the manager:\n  runner-farmctl uninstall --all\n\nUninstall runner-farmctl itself (after farms are removed):\n  runner-farmctl manager-uninstall\n'
+printf '\nHost prerequisites and manager runtime are ready. No farm was created.\n\nOpen the TUI:\n  runner-farmctl\n\nInstall a farm:\n  runner-farmctl install <repo/org>\n\nExamples:\n  runner-farmctl install SkyTeamExec/Github-Runner-Farm-Manager\n  runner-farmctl install SkyTeamExec\n\nRemove one farm:\n  runner-farmctl uninstall <farm>\n\nRemove all farms but keep the manager:\n  runner-farmctl uninstall --all\n\nUninstall runner-farmctl itself (after farms are removed):\n  runner-farmctl manager-uninstall\n'
