@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG MANAGER_VERSION=1.0.0
+ARG IMAGE_VERSION=1.0.0
 ARG TARGETARCH=amd64
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -9,7 +9,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 LABEL org.opencontainers.image.title="GitHub Runner Farm Universal Ubuntu Worker" \
       org.opencontainers.image.description="Ephemeral universal GitHub Actions self-hosted runner with isolated Docker-in-Docker" \
       org.opencontainers.image.source="https://github.com/SkyTeamExec/Github-Runner-Farm-Manager" \
-      org.opencontainers.image.version="${MANAGER_VERSION}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
       org.opencontainers.image.licenses="MIT"
 
 ENV TZ=Etc/UTC \
@@ -27,7 +27,7 @@ ENV TZ=Etc/UTC \
     DENO_INSTALL=/opt/deno \
     PATH=/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/dotnet:/opt/cargo/bin:/opt/bun/bin:/opt/deno/bin:/opt/go/bin:/opt/gradle/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-RUN test "$TARGETARCH" = "amd64" || (echo "v1.0.0 currently supports linux/amd64 only" >&2; exit 2)
+RUN test "$TARGETARCH" = "amd64" || (echo "Worker image v${IMAGE_VERSION} currently supports linux/amd64 only" >&2; exit 2)
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     apt-transport-https bash bc bison build-essential ca-certificates ccache clang clang-format clang-tidy \
