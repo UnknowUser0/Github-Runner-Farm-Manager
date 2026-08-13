@@ -1,6 +1,6 @@
 # GitHub Runner Farm Manager
 
-GitHub Runner Farm Manager manages multiple ephemeral self-hosted GitHub Actions runner farms on one host. Each repository or organization is independent, with its own desired runner count, systemd service, container namespace, GitHub runner prefix, resource policy, labels, and reconciliation loop.
+GitHub Runner Farm Manager manages multiple ephemeral self-hosted GitHub Actions runner farms on one Linux host. Each repository or organization is independent, with its own desired runner count, systemd service, container namespace, GitHub runner prefix, resource policy, labels, and reconciliation loop.
 
 Authentication is stored once and reused by additional farms.
 
@@ -26,13 +26,27 @@ Default image:
 ghcr.io/skyteamexec/github-runner-farm-manager:v1.0.0
 ```
 
-## Install the manager
+## Bootstrap installation
+
+Install the manager and host prerequisites with one command:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SkyTeamExec/Github-Runner-Farm-Manager/main/install.sh | sh
 ```
 
-The bootstrap installs only `runner-farmctl` and Bash/Zsh/Fish completions. It does not create a farm.
+The bootstrap does **not** create a farm and does not ask for a repository or organization. It prepares the host once by:
+
+- validating Linux, linux/amd64, and systemd;
+- installing small host dependencies through `apt-get`, `dnf`, `yum`, `pacman`, or `zypper`;
+- installing Docker Engine automatically on Debian, Ubuntu, Fedora, RHEL, and CentOS when Docker is not already usable;
+- keeping an existing Docker installation when `docker info` already succeeds;
+- installing the official GitHub CLI Linux binary with SHA-256 checksum verification when `gh` is missing;
+- installing `/usr/local/bin/runner-farmctl`;
+- installing Bash, Zsh, and Fish completions.
+
+For distributions where automatic Docker installation is intentionally not enabled, install Docker Engine using the distribution/vendor-supported method first and rerun the bootstrap.
+
+After bootstrap, adding farms does not run the package manager and does not install Docker or GitHub CLI again. `runner-farmctl install` only validates that the prerequisites prepared by the bootstrap are still available.
 
 Open the TUI:
 
@@ -185,6 +199,8 @@ Each farm uses its own runner prefix so synchronization only targets registratio
 
 The worker image is an Ubuntu-based linux/amd64 CI environment with Docker-in-Docker and a broad toolchain including Git/GitHub CLI, Node.js, Bun, Deno, Java, Maven, Gradle, Python, Go, Rust, .NET, PHP, Ruby, Android SDK, database clients, kubectl, Helm, Terraform, AWS CLI, Chrome, ffmpeg, ImageMagick, protobuf, ShellCheck, and common build tools.
 
+The host OS does not need to be Ubuntu. The runner workload is Ubuntu because it runs inside the universal worker container.
+
 Each runner gets its own Docker daemon and does not mount the host `/var/run/docker.sock`.
 
 The privileged Docker-in-Docker container provides separate workspace and Docker state between runners, but it should not be treated as equivalent to a virtual machine security boundary.
@@ -224,9 +240,9 @@ runner-farmctl limits <target> host
 runner-farmctl limits <target> <cpu> <ram> [swap]
 runner-farmctl labels <target> <labels>
 runner-farmctl image-pull [target|--all]
-runner-farmctl start <target|--all>
-runner-farmctl stop <target|--all>
-runner-farmctl restart <target|--all>
+runner-farmctl start <target|--all]
+runner-farmctl stop <target|--all]
+runner-farmctl restart <target|--all]
 runner-farmctl config <target>
 runner-farmctl uninstall <target>
 runner-farmctl uninstall --all
@@ -238,7 +254,7 @@ See [`docs/runner-farmctl.md`](docs/runner-farmctl.md) for the command reference
 
 ## Uninstall
 
-### Remove one farm
+Remove one farm:
 
 ```bash
 runner-farmctl uninstall <target>
@@ -252,7 +268,7 @@ Remove that farm's configured worker image too:
 runner-farmctl uninstall <target> --purge-image
 ```
 
-### Remove every farm but keep the manager
+Remove every farm but keep the manager:
 
 ```bash
 runner-farmctl uninstall --all
@@ -264,26 +280,12 @@ Remove configured worker images too:
 runner-farmctl uninstall --all --purge-image
 ```
 
-`runner-farmctl` and saved manager authentication remain available for future farms.
-
-### Uninstall `runner-farmctl`
-
-Remove all farms first:
-
-```bash
-runner-farmctl uninstall --all
-```
-
-Then uninstall the manager:
+To uninstall the manager itself, remove all farms first and then run:
 
 ```bash
 runner-farmctl manager-uninstall
 ```
 
-`manager-uninstall` removes the manager binary, supervisor, systemd service template, shell completion files, manager runtime/configuration data, and the manager authentication file.
-
-It does not uninstall the system GitHub CLI package or remove GitHub CLI's own login state because those may be used separately.
-
-If worker images should be removed, use `runner-farmctl uninstall --all --purge-image` before `manager-uninstall`.
+`manager-uninstall` removes the manager binary, supervisor, systemd service template, shell completion files, manager runtime/configuration data, and manager authentication. It deliberately does **not** uninstall Docker Engine, GitHub CLI, or other host packages installed during bootstrap because those may be used by unrelated software.
 
 `runner-farmctl self-uninstall` remains available as a deprecated compatibility alias.
