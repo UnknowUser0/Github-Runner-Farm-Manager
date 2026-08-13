@@ -1,29 +1,19 @@
 # GitHub Runner Farm Manager
 
-GitHub Runner Farm Manager manages multiple **ephemeral self-hosted GitHub Actions runner farms** on one Ubuntu host.
+GitHub Runner Farm Manager manages multiple ephemeral self-hosted GitHub Actions runner farms on one host. Each repository or organization is independent, with its own desired runner count, systemd service, container namespace, GitHub runner prefix, resource policy, labels, and reconciliation loop.
 
-Each repository or organization is managed as an independent farm with its own:
-
-- desired runner count;
-- systemd service;
-- container namespace;
-- GitHub runner prefix;
-- CPU/RAM/swap policy;
-- labels;
-- reconciliation loop.
-
-Authentication is stored once on the host and reused for every farm.
+Authentication is stored once and reused by additional farms.
 
 ## Versions
 
-Manager/CLI and worker image versions are intentionally independent:
+Manager and worker image versions are intentionally separate:
 
 ```text
 VERSION        -> runner-farmctl / manager version
-IMAGE_VERSION  -> GHCR universal worker image version
+IMAGE_VERSION  -> universal GHCR worker image version
 ```
 
-Current initial release:
+Current v1 values:
 
 ```text
 Manager: v1.0.0
@@ -36,23 +26,13 @@ Default image:
 ghcr.io/skyteamexec/github-runner-farm-manager:v1.0.0
 ```
 
-A manager-only change does not require rebuilding the worker image.
-
 ## Install the manager
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SkyTeamExec/Github-Runner-Farm-Manager/main/install.sh | sh
 ```
 
-The bootstrap installs:
-
-```text
-/usr/local/bin/runner-farmctl
-```
-
-and Bash, Zsh, and Fish command completion definitions.
-
-It does **not** create a GitHub runner farm yet.
+The bootstrap installs only `runner-farmctl` and Bash/Zsh/Fish completions. It does not create a farm.
 
 Open the TUI:
 
@@ -60,37 +40,23 @@ Open the TUI:
 runner-farmctl
 ```
 
-Or install directly from the CLI:
+Install a repository farm:
 
 ```bash
-runner-farmctl install SkyTeamExec/Github-Runner-Farm-Manager
+runner-farmctl install OWNER/REPOSITORY
 ```
 
-Organization example:
+Install an organization farm:
 
 ```bash
-runner-farmctl install SkyTeamExec
+runner-farmctl install ORGANIZATION
 ```
 
-URLs are also accepted:
-
-```bash
-runner-farmctl install https://github.com/OWNER/REPOSITORY
-runner-farmctl install https://github.com/ORGANIZATION
-```
+GitHub URLs are also accepted.
 
 ## Authentication
 
-The first farm installation asks for one of:
-
-```text
-1. GitHub browser/device login
-2. Personal Access Token (PAT)
-```
-
-Authentication is stored globally for this host and reused when additional repositories or organizations are installed.
-
-Manage authentication explicitly:
+The first farm installation asks for either GitHub browser/device login or a Personal Access Token. Later farm installations reuse the saved authentication.
 
 ```bash
 runner-farmctl auth status
@@ -99,7 +65,7 @@ runner-farmctl auth pat
 runner-farmctl auth logout
 ```
 
-Browser/device login uses GitHub CLI. PAT mode stores the token in:
+The manager authentication file is stored at:
 
 ```text
 /etc/github-runner-farm/auth.env
@@ -107,9 +73,9 @@ Browser/device login uses GitHub CLI. PAT mode stores the token in:
 
 with root-only permissions.
 
-## Multiple repositories and organizations
+## Multi-farm management
 
-One host can manage multiple targets at the same time:
+One host can manage several repositories and organizations at the same time:
 
 ```bash
 runner-farmctl install UnknowUser0/Sky-Music
@@ -117,86 +83,54 @@ runner-farmctl install UnknowUser0/Backend-w4g
 runner-farmctl install SkyTeamExec
 ```
 
-List all installed farms:
+List farms:
 
 ```bash
 runner-farmctl list
 ```
 
-Each target receives a unique instance ID and a dedicated systemd service:
-
-```text
-github-runner-farm@<instance>.service
-```
-
-Target configs are stored separately:
+Each farm has a separate target configuration and systemd service:
 
 ```text
 /etc/github-runner-farm/targets/<instance>.env
+github-runner-farm@<instance>.service
 ```
+
+Stopping, restarting, scaling, or removing one farm does not remove other farm configurations.
 
 ## TUI
 
-Run the command without arguments:
+Run:
 
 ```bash
 runner-farmctl
 ```
 
-The TUI can:
+The TUI can list farms, install another target, inspect status, scale runners, edit resources, synchronize registrations, reconcile workers, show logs, start/stop/restart a farm, remove a farm, and inspect authentication.
 
-- list installed farms;
-- install another repository or organization;
-- inspect status;
-- scale a farm;
-- change CPU/RAM/swap settings;
-- synchronize GitHub registrations;
-- reconcile local workers;
-- show logs;
-- start/stop/restart a farm;
-- remove a farm;
-- inspect authentication.
-
-The normal CLI remains available for scripting and users who prefer commands.
+The normal CLI remains available for scripting.
 
 ## Shell completion
 
-The bootstrap installs completion for:
-
-- Bash;
-- Zsh;
-- Fish.
-
-It completes subcommands and installed farm instance IDs.
-
-Reinstall completion files manually:
+Completion is installed automatically for Bash, Zsh, and Fish.
 
 ```bash
 runner-farmctl completion install
 ```
 
-## Runner resources
+Installed farm IDs are offered for commands that accept a farm target.
 
-The default resource mode is:
+## Resource behavior
+
+The default mode is:
 
 ```text
 host/unlimited
 ```
 
-No Docker `--cpus`, `--memory`, or `--memory-swap` limits are applied. Each runner may use the resources currently available on the host. Resources are shared between concurrent runners; they are not exclusively reserved.
+No Docker CPU/RAM/swap limits are applied by default. Runners share the resources available on the host; this is not exclusive reservation.
 
-During custom configuration, the manager displays:
-
-- physical cores;
-- logical CPUs/threads;
-- RAM;
-- swap.
-
-CPU validation uses unique Linux `SOCKET,CORE` pairs rather than logical SMT threads. A requested per-runner CPU value greater than the detected physical-core count is rejected.
-
-On a VM, the manager can only validate the CPU topology exposed by the hypervisor; it cannot see the physical topology of the underlying host.
-
-RAM cannot exceed host RAM, and configured swap cannot exceed host swap.
+For custom limits, CPU validation uses unique Linux `SOCKET,CORE` pairs instead of logical SMT threads. RAM cannot exceed host RAM and configured swap cannot exceed host swap.
 
 Example:
 
@@ -204,7 +138,7 @@ Example:
 runner-farmctl limits <target> 4 8G 4G
 ```
 
-This becomes:
+Docker receives:
 
 ```text
 --cpus 4
@@ -212,116 +146,61 @@ This becomes:
 --memory-swap 12G
 ```
 
-`--memory-swap` is correctly calculated as RAM + swap.
+`--memory-swap` is RAM plus additional swap.
 
-Return to unrestricted mode:
+Return to host/unlimited mode:
 
 ```bash
 runner-farmctl limits <target> host
 ```
 
-Resource changes apply to newly spawned ephemeral workers and do not intentionally terminate current jobs.
+## Scaling and synchronization
 
-## Scaling
+Scale a farm:
 
 ```bash
 runner-farmctl scale <target> 8
 runner-farmctl scale <target> 2
 ```
 
-If exactly one farm is installed, the target can be omitted:
+The supervisor creates missing slots, drains busy excess workers during scale-down, and replaces exited ephemeral workers when the desired count still requires them.
+
+Manual local reconciliation:
 
 ```bash
-runner-farmctl scale 8
+runner-farmctl reconcile <target>
+runner-farmctl reconcile --all
 ```
 
-The supervisor is desired-state based:
-
-- missing slots are spawned automatically;
-- idle excess slots are removed during scale-down;
-- busy excess runners are drained;
-- exited ephemeral workers are removed and replaced when still desired.
-
-## GitHub runner synchronization
-
-Each farm continuously reconciles **local containers and GitHub runner registrations**.
-
-A runner registration belongs to a farm only when its name starts with that farm's unique host+target prefix.
-
-The synchronization process:
-
-- removes a farm registration that has no matching local running container;
-- removes stale `Offline` registrations;
-- replaces a local worker that stays `Offline` past the grace period;
-- prevents old registrations from accumulating when an ephemeral container crashes;
-- does not touch self-hosted runners created outside this farm prefix.
-
-Manual synchronization:
+Manual GitHub runner synchronization:
 
 ```bash
 runner-farmctl sync <target>
-```
-
-Synchronize every installed farm:
-
-```bash
 runner-farmctl sync --all
 ```
 
-This specifically prevents states such as an old `s2` runner remaining `Offline` while a newer `s2` runner is already active.
+Each farm uses its own runner prefix so synchronization only targets registrations owned by that farm.
 
-## Universal Ubuntu worker
+## Universal worker image
 
-The v1 worker image targets Ubuntu/Linux AMD64 and includes one broad toolchain image rather than separate language images.
+The worker image is an Ubuntu-based linux/amd64 CI environment with Docker-in-Docker and a broad toolchain including Git/GitHub CLI, Node.js, Bun, Deno, Java, Maven, Gradle, Python, Go, Rust, .NET, PHP, Ruby, Android SDK, database clients, kubectl, Helm, Terraform, AWS CLI, Chrome, ffmpeg, ImageMagick, protobuf, ShellCheck, and common build tools.
 
-Included tooling covers:
+Each runner gets its own Docker daemon and does not mount the host `/var/run/docker.sock`.
 
-- Docker Engine, Compose v2, Buildx;
-- Git, Git LFS, GitHub CLI;
-- Java 17 and Java 21;
-- Maven and Gradle;
-- Node.js 24 LTS, npm, pnpm, Yarn/Corepack;
-- Bun and Deno;
-- Python 3, pip, pipx;
-- Go stable;
-- Rust stable, Cargo, rustfmt, Clippy;
-- .NET 10;
-- PHP and Composer;
-- Ruby and Bundler;
-- GCC/G++, Clang/LLVM, CMake, Ninja, Meson;
-- Android SDK, platform-tools/ADB, API 36, Build Tools 36.0.0;
-- PostgreSQL, MySQL, Redis clients;
-- kubectl, Helm, Terraform, AWS CLI v2, yq;
-- Google Chrome;
-- ffmpeg, ImageMagick, protobuf compiler, ShellCheck, and common Linux utilities.
-
-Each worker runs a private Docker daemon. The host Docker socket is not shared with workflow jobs.
+The privileged Docker-in-Docker container provides separate workspace and Docker state between runners, but it should not be treated as equivalent to a virtual machine security boundary.
 
 ## Worker image CI
 
-The worker image workflow runs automatically only when image-related files change:
+The large worker image is rebuilt automatically only for image-related changes:
 
 ```text
 IMAGE_VERSION
 docker/**
 ```
 
-Changes to:
+Manager/docs-only changes do not trigger the image build. `workflow_dispatch` remains available for manual image builds.
 
-```text
-README.md
-docs/**
-runner-farmctl
-runner-farm-supervisor
-install.sh
-VERSION
-```
-
-do not rebuild the large worker image.
-
-The workflow can still be started manually with `workflow_dispatch`.
-
-Published tags include:
+Published image tags include:
 
 ```text
 v<IMAGE_VERSION>
@@ -334,49 +213,77 @@ sha-...
 
 ```bash
 runner-farmctl
+runner-farmctl install <repo/org>
 runner-farmctl list
-runner-farmctl status
-runner-farmctl status <target>
+runner-farmctl status [target]
 runner-farmctl logs <target>
 runner-farmctl scale <target> <count>
-runner-farmctl reconcile <target>
-runner-farmctl sync <target>
+runner-farmctl reconcile [target|--all]
+runner-farmctl sync [target|--all]
 runner-farmctl limits <target> host
 runner-farmctl limits <target> <cpu> <ram> [swap]
 runner-farmctl labels <target> <labels>
-runner-farmctl image-pull <target>
-runner-farmctl start <target>
-runner-farmctl stop <target>
-runner-farmctl restart <target>
+runner-farmctl image-pull [target|--all]
+runner-farmctl start <target|--all>
+runner-farmctl stop <target|--all>
+runner-farmctl restart <target|--all>
 runner-farmctl config <target>
 runner-farmctl uninstall <target>
+runner-farmctl uninstall --all
+runner-farmctl manager-uninstall
 runner-farmctl version
 ```
 
-See [`docs/runner-farmctl.md`](docs/runner-farmctl.md) for the full command reference.
+See [`docs/runner-farmctl.md`](docs/runner-farmctl.md) for the command reference.
 
-## Remove one farm
+## Uninstall
+
+### Remove one farm
 
 ```bash
 runner-farmctl uninstall <target>
 ```
 
-Remove its local image too:
+The manager, saved authentication, and all other farms remain installed.
+
+Remove that farm's configured worker image too:
 
 ```bash
 runner-farmctl uninstall <target> --purge-image
 ```
 
-The manager and saved authentication remain installed so another farm can be created immediately.
-
-Remove the manager itself only after all farms have been removed:
+### Remove every farm but keep the manager
 
 ```bash
-runner-farmctl self-uninstall
+runner-farmctl uninstall --all
 ```
 
-## Security model
+Remove configured worker images too:
 
-Workers use privileged Docker-in-Docker for broad Docker/Compose compatibility and strong separation of workspace, cache, and Docker state between runner containers.
+```bash
+runner-farmctl uninstall --all --purge-image
+```
 
-A privileged container is **not** a VM-grade security boundary. Do not treat this design as safe for arbitrary hostile public pull-request code without an additional VM/microVM boundary.
+`runner-farmctl` and saved manager authentication remain available for future farms.
+
+### Uninstall `runner-farmctl`
+
+Remove all farms first:
+
+```bash
+runner-farmctl uninstall --all
+```
+
+Then uninstall the manager:
+
+```bash
+runner-farmctl manager-uninstall
+```
+
+`manager-uninstall` removes the manager binary, supervisor, systemd service template, shell completion files, manager runtime/configuration data, and the manager authentication file.
+
+It does not uninstall the system GitHub CLI package or remove GitHub CLI's own login state because those may be used separately.
+
+If worker images should be removed, use `runner-farmctl uninstall --all --purge-image` before `manager-uninstall`.
+
+`runner-farmctl self-uninstall` remains available as a deprecated compatibility alias.
