@@ -240,9 +240,9 @@ runner-farmctl limits <target> host
 runner-farmctl limits <target> <cpu> <ram> [swap]
 runner-farmctl labels <target> <labels>
 runner-farmctl image-pull [target|--all]
-runner-farmctl start <target|--all]
-runner-farmctl stop <target|--all]
-runner-farmctl restart <target|--all]
+runner-farmctl start <target|--all>
+runner-farmctl stop <target|--all>
+runner-farmctl restart <target|--all>
 runner-farmctl config <target>
 runner-farmctl uninstall <target>
 runner-farmctl uninstall --all
