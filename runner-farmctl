@@ -81,54 +81,154 @@ ensure_dirs() {
   install -d -m 0755 "$RUNTIME_DIR" /usr/local/libexec
 }
 
+host_os_id() {
+  if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+    printf '%s' "${ID:-unknown}"
+  else
+    printf 'unknown'
+  fi
+}
+
+host_os_like() {
+  if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+    printf '%s' "${ID_LIKE:-}"
+  fi
+}
+
+detect_package_manager() {
+  local pm
+  for pm in apt-get dnf yum pacman zypper; do
+    if command -v "$pm" >/dev/null 2>&1; then
+      printf '%s' "$pm"
+      return 0
+    fi
+  done
+  return 1
+}
+
 check_host() {
-  [[ -r /etc/os-release ]] || die "Cannot read /etc/os-release."
-  . /etc/os-release
-  [[ "${ID:-}" == "ubuntu" ]] || die "v${MANAGER_VERSION} currently supports Ubuntu Linux only. Detected: ${ID:-unknown}."
-  case "$(uname -m)" in x86_64|amd64) ;; *) die "The v${IMAGE_VERSION} worker image currently supports linux/amd64 only." ;; esac
+  [[ "$(uname -s)" == "Linux" ]] || die "runner-farmctl requires a Linux host."
+  case "$(uname -m)" in
+    x86_64|amd64) ;;
+    *) die "The v${IMAGE_VERSION} worker image currently supports linux/amd64 only." ;;
+  esac
+  command -v systemctl >/dev/null 2>&1 || die "systemd is required by runner-farmctl v1."
+  [[ -d /run/systemd/system ]] || die "systemd is not running as PID 1 on this host."
 }
 
 install_base_dependencies() {
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl jq gnupg lsb-release systemd util-linux coreutils whiptail
+  local pm
+  pm="$(detect_package_manager)" || die "No supported package manager was detected. Install curl, jq, util-linux, coreutils, ca-certificates, and whiptail/newt, then retry."
+  case "$pm" in
+    apt-get)
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl jq gnupg systemd util-linux coreutils tar whiptail
+      ;;
+    dnf)
+      dnf install -y ca-certificates curl jq gnupg2 systemd util-linux coreutils tar newt
+      ;;
+    yum)
+      yum install -y ca-certificates curl jq gnupg2 systemd util-linux coreutils tar newt
+      ;;
+    pacman)
+      pacman -Sy --needed --noconfirm ca-certificates curl jq gnupg systemd util-linux coreutils tar libnewt
+      ;;
+    zypper)
+      zypper --non-interactive refresh
+      zypper --non-interactive install ca-certificates curl jq gpg2 systemd util-linux coreutils tar newt
+      ;;
+  esac
+  local cmd
+  for cmd in curl jq lscpu numfmt awk sort sha256sum tar; do
+    command -v "$cmd" >/dev/null 2>&1 || die "Required command '$cmd' is unavailable after dependency installation."
+  done
 }
 
 install_docker_host() {
   if command -v docker >/dev/null 2>&1; then
     systemctl enable --now docker >/dev/null 2>&1 || true
+    if docker info >/dev/null 2>&1; then
+      log "Using the existing Docker Engine installation."
+      return
+    fi
+    warn "Docker CLI exists but 'docker info' failed; attempting to start the daemon."
+    systemctl enable --now docker >/dev/null 2>&1 || true
     docker info >/dev/null 2>&1 && return
   fi
-  log "Installing Docker Engine from Docker's official Ubuntu repository..."
-  . /etc/os-release
-  local codename="${VERSION_CODENAME:-}"
-  [[ -n "$codename" ]] || die "Ubuntu VERSION_CODENAME was not found."
-  apt-get remove -y docker.io docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc 2>/dev/null || true
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-  chmod a+r /etc/apt/keyrings/docker.asc
-  printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu %s stable\n' "$(dpkg --print-architecture)" "$codename" > /etc/apt/sources.list.d/docker.list
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+  local id like supported=false tmp
+  id="$(host_os_id)"
+  like="$(host_os_like)"
+  case "$id" in
+    ubuntu|debian|fedora|rhel|centos) supported=true ;;
+  esac
+
+  if [[ "$supported" != true ]]; then
+    die "Docker Engine is not available and automatic Docker installation is not enabled for '$id'. Install Docker Engine for this distribution, verify 'docker info' succeeds, then rerun runner-farmctl. Detected ID_LIKE: ${like:-none}."
+  fi
+
+  log "Installing Docker Engine using Docker's official installer for $id..."
+  tmp="$(mktemp)"
+  curl -fsSL https://get.docker.com -o "$tmp"
+  sh "$tmp"
+  rm -f "$tmp"
   systemctl enable --now docker
-  docker info >/dev/null
+  docker info >/dev/null 2>&1 || die "Docker Engine was installed but 'docker info' still fails."
 }
 
 install_github_cli() {
   command -v gh >/dev/null 2>&1 && return
-  log "Installing GitHub CLI for browser/device authentication..."
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
-  chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y gh
+
+  local tmpdir release_json tag version archive checksums expected
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' RETURN
+  release_json="$tmpdir/release.json"
+
+  log "Installing the official GitHub CLI Linux binary..."
+  curl -fsSL -H 'Accept: application/vnd.github+json' https://api.github.com/repos/cli/cli/releases/latest -o "$release_json"
+  tag="$(jq -r '.tag_name // empty' "$release_json")"
+  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Could not resolve the latest GitHub CLI release."
+  version="${tag#v}"
+  archive="gh_${version}_linux_amd64.tar.gz"
+  checksums="gh_${version}_checksums.txt"
+
+  curl -fL "https://github.com/cli/cli/releases/download/${tag}/${archive}" -o "$tmpdir/$archive"
+  curl -fL "https://github.com/cli/cli/releases/download/${tag}/${checksums}" -o "$tmpdir/$checksums"
+
+  expected="$(awk -v file="$archive" '$2 == file {print $1; exit}' "$tmpdir/$checksums")"
+  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "The GitHub CLI release checksum was not found."
+  printf '%s  %s\n' "$expected" "$tmpdir/$archive" | sha256sum -c - >/dev/null || die "GitHub CLI checksum verification failed."
+
+  tar -xzf "$tmpdir/$archive" -C "$tmpdir"
+  install -m 0755 "$tmpdir/gh_${version}_linux_amd64/bin/gh" /usr/local/bin/gh
+  gh --version >/dev/null 2>&1 || die "GitHub CLI installation failed."
+  trap - RETURN
+  rm -rf "$tmpdir"
 }
 
-physical_cores() { local c; c="$(lscpu -p=SOCKET,CORE 2>/dev/null | awk -F, '!/^#/ {print $1 ":" $2}' | sort -u | wc -l | tr -d ' ')"; [[ "$c" =~ ^[1-9][0-9]*$ ]] || c="$(nproc)"; printf '%s' "$c"; }
+physical_cores() {
+  local c
+  c="$(lscpu -p=SOCKET,CORE 2>/dev/null | awk -F, '!/^#/ && $1 != "" && $2 != "" {print $1 ":" $2}' | sort -u | wc -l | tr -d ' ')"
+  if [[ ! "$c" =~ ^[1-9][0-9]*$ ]]; then
+    c="$(lscpu -p=CORE 2>/dev/null | awk -F, '!/^#/ && $1 != "" {print $1}' | sort -u | wc -l | tr -d ' ')"
+  fi
+  [[ "$c" =~ ^[1-9][0-9]*$ ]] || c="$(nproc)"
+  printf '%s' "$c"
+}
 logical_cpus() { nproc; }
 host_memory_bytes() { awk '/MemTotal:/ {printf "%.0f", $2 * 1024}' /proc/meminfo; }
 host_swap_bytes() { awk '/SwapTotal:/ {printf "%.0f", $2 * 1024}' /proc/meminfo; }
-size_to_bytes() { local r="$1" n; [[ "$r" =~ ^[0-9]+([.][0-9]+)?[kKmMgGtT]?[iI]?[bB]?$ ]] || return 1; n="$(tr '[:lower:]' '[:upper:]' <<<"$r")"; n="${n%B}"; n="${n%I}"; [[ "$n" == 0 ]] && { printf 0; return; }; numfmt --from=iec "$n" 2>/dev/null; }
+size_to_bytes() {
+  local r="$1" n
+  [[ "$r" =~ ^[0-9]+([.][0-9]+)?[kKmMgGtT]?[iI]?[bB]?$ ]] || return 1
+  n="$(tr '[:lower:]' '[:upper:]' <<<"$r")"
+  n="${n%B}"
+  n="${n%I}"
+  [[ "$n" == 0 ]] && { printf 0; return; }
+  numfmt --from=iec "$n" 2>/dev/null
+}
 bytes_human() { numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || printf '%sB' "$1"; }
 
 validate_resources() {
@@ -145,7 +245,14 @@ validate_resources() {
   VALID_CPU="$cpu"; VALID_MEMORY_BYTES="$rb"; VALID_SWAP_BYTES="$sb"
 }
 
-normalize_target() { local r="$1"; r="${r%%\?*}"; r="${r%%#*}"; r="${r%.git}"; r="${r%/}"; [[ "$r" == https://github.com/* ]] && { printf '%s' "$r"; return; }; r="${r#github.com/}"; [[ -n "$r" ]] || die "Target cannot be empty."; printf 'https://github.com/%s' "$r"; }
+normalize_target() {
+  local r="$1"
+  r="${r%%\?*}"; r="${r%%#*}"; r="${r%.git}"; r="${r%/}"
+  [[ "$r" == https://github.com/* ]] && { printf '%s' "$r"; return; }
+  r="${r#github.com/}"
+  [[ -n "$r" ]] || die "Target cannot be empty."
+  printf 'https://github.com/%s' "$r"
+}
 
 auth_method() { [[ -f "$AUTH_FILE" ]] || { printf none; return; }; source "$AUTH_FILE"; printf '%s' "${AUTH_METHOD:-none}"; }
 get_token() { [[ -f "$AUTH_FILE" ]] || return 1; source "$AUTH_FILE"; case "${AUTH_METHOD:-}" in pat) [[ -n "${GITHUB_PAT:-}" ]] || return 1; printf '%s' "$GITHUB_PAT" ;; gh) GH_CONFIG_DIR=/root/.config/gh gh auth token --hostname github.com 2>/dev/null ;; *) return 1 ;; esac; }
@@ -237,7 +344,6 @@ cmd_install() { local raw="${1:-}" url; [[ -n "$raw" ]] || die "Usage: runner-fa
 local_live_count() { docker ps -q --filter "label=grfm.managed=true" --filter "label=grfm.instance=$1" | wc -l | tr -d ' '; }
 
 cmd_list() { local id cfg live; [[ "${1:-}" == --ids ]] && { installed_ids; return; }; [[ "$(target_count)" != 0 ]] || { printf 'No runner farms installed.\n'; return; }; printf '%-28s %-36s %-6s %-7s %-7s\n' INSTANCE TARGET SCOPE DESIRED LIVE; while IFS= read -r id; do cfg="$(target_config_path "$id")"; source "$cfg"; live="$(local_live_count "$id")"; printf '%-28s %-36s %-6s %-7s %-7s\n' "$id" "$TARGET_KEY" "$GITHUB_SCOPE" "$RUNNER_COUNT" "$live"; done < <(installed_ids); }
-
 print_target_status() { local id="$1" state live res; load_target "$id"; state="$(systemctl is-active "$(service_name "$id")" 2>/dev/null || true)"; live="$(local_live_count "$id")"; [[ -z "${RUNNER_CPU:-}" ]] && res=host/unlimited || res="cpu=$RUNNER_CPU ram=$(bytes_human "$RUNNER_MEMORY_BYTES") swap=$(bytes_human "$RUNNER_SWAP_BYTES")"; printf 'Instance        : %s\nTarget          : %s (%s)\nService         : %s\nDesired runners : %s\nLive containers : %s\nResources       : %s\nImage           : %s\nRunner prefix   : %s\n' "$id" "$TARGET_KEY" "$GITHUB_SCOPE" "$state" "$RUNNER_COUNT" "$live" "$res" "$IMAGE_NAME" "$RUNNER_PREFIX"; }
 cmd_status() { local q="${1:-}" id first=1; [[ -n "$q" ]] && { print_target_status "$(resolve_target "$q")"; return; }; while IFS= read -r id; do ((first==1)) || printf '\n'; print_target_status "$id"; first=0; done < <(installed_ids); }
 cmd_logs() { local id; id="$(resolve_target "${1:-}")"; journalctl -u "$(service_name "$id")" -f; }
@@ -249,7 +355,6 @@ _do_reconcile() { wake_service "$1"; }
 cmd_reconcile() { iterate_targets "${1:---all}" _do_reconcile; }
 _do_sync() { "$SUPERVISOR_PATH" --sync-once "$1"; }
 cmd_sync() { iterate_targets "${1:---all}" _do_sync; }
-
 cmd_limits() { local id mode cpu ram swap; if [[ $# -ge 1 && "$(target_count)" == 1 && ("$1" == host || "$1" =~ ^[0-9]) ]]; then id="$(resolve_target "")"; else [[ $# -ge 2 ]] || die "Usage: limits <target> host|<cpu> <ram> [swap]"; id="$(resolve_target "$1")"; shift; fi; mode="$1"; shift || true; if [[ "$mode" == host || "$mode" == unlimited ]]; then set_target_cfg "$id" RUNNER_CPU ""; set_target_cfg "$id" RUNNER_MEMORY_BYTES ""; set_target_cfg "$id" RUNNER_SWAP_BYTES ""; return; fi; cpu="$mode"; [[ $# -ge 1 ]] || die "RAM required."; ram="$1"; shift; swap="${1:-0}"; validate_resources "$cpu" "$ram" "$swap"; set_target_cfg "$id" RUNNER_CPU "$VALID_CPU"; set_target_cfg "$id" RUNNER_MEMORY_BYTES "$VALID_MEMORY_BYTES"; set_target_cfg "$id" RUNNER_SWAP_BYTES "$VALID_SWAP_BYTES"; }
 cmd_labels() { local id labels; [[ $# -eq 2 ]] && { id="$(resolve_target "$1")"; labels="$2"; } || { [[ $# -eq 1 && "$(target_count)" == 1 ]] || die "Usage: labels <target> <labels>"; id="$(resolve_target "")"; labels="$1"; }; set_target_cfg "$id" RUNNER_LABELS "$labels"; }
 _do_image_pull() { pull_image_for_id "$1"; }
@@ -258,51 +363,10 @@ _do_start() { systemctl start "$(service_name "$1")"; }; _do_stop() { systemctl 
 cmd_start() { iterate_targets "${1:---all}" _do_start; }; cmd_stop() { iterate_targets "${1:---all}" _do_stop; }; cmd_restart() { iterate_targets "${1:---all}" _do_restart; }
 cmd_config() { cat "$(target_config_path "$(resolve_target "${1:-}")")"; }
 
-remove_farm_by_id() {
-  local id="$1" force="$2" purge="$3"
-  load_target "$id"
-  systemctl disable --now "$(service_name "$id")" >/dev/null 2>&1 || true
-  docker ps -aq --filter "label=grfm.managed=true" --filter "label=grfm.instance=$id" | xargs -r docker rm -f >/dev/null 2>&1 || true
-  "$SUPERVISOR_PATH" --purge-github "$id" "$force"
-  rm -f "$(target_config_path "$id")"
-  [[ "$purge" == true ]] && docker image rm "$IMAGE_NAME" >/dev/null 2>&1 || true
-  log "Removed farm '$id'; manager and saved authentication remain."
-}
-
-cmd_uninstall() {
-  local q="" force=false purge=false all=false a id
-  local -a ids=()
-  for a in "$@"; do
-    case "$a" in
-      --all) all=true ;;
-      --force) force=true ;;
-      --purge-image) purge=true ;;
-      -h|--help) printf 'Usage: runner-farmctl uninstall <target> [--force] [--purge-image]\n       runner-farmctl uninstall --all [--force] [--purge-image]\n'; return ;;
-      --*) die "Unknown uninstall option: $a" ;;
-      *) [[ -z "$q" ]] || die "Only one target may be specified."; q="$a" ;;
-    esac
-  done
-
-  if [[ "$all" == true ]]; then
-    [[ -z "$q" ]] || die "Do not combine --all with a target."
-    mapfile -t ids < <(installed_ids)
-    if ((${#ids[@]} == 0)); then
-      log "No runner farms are installed."
-      return
-    fi
-    for id in "${ids[@]}"; do
-      remove_farm_by_id "$id" "$force" "$purge"
-    done
-    log "All runner farms were removed. runner-farmctl and saved authentication remain installed."
-    return
-  fi
-
-  id="$(resolve_target "$q")"
-  remove_farm_by_id "$id" "$force" "$purge"
-}
+remove_farm_by_id() { local id="$1" force="$2" purge="$3"; load_target "$id"; systemctl disable --now "$(service_name "$id")" >/dev/null 2>&1 || true; docker ps -aq --filter "label=grfm.managed=true" --filter "label=grfm.instance=$id" | xargs -r docker rm -f >/dev/null 2>&1 || true; "$SUPERVISOR_PATH" --purge-github "$id" "$force"; rm -f "$(target_config_path "$id")"; [[ "$purge" == true ]] && docker image rm "$IMAGE_NAME" >/dev/null 2>&1 || true; log "Removed farm '$id'; manager and saved authentication remain."; }
+cmd_uninstall() { local q="" force=false purge=false all=false a id; local -a ids=(); for a in "$@"; do case "$a" in --all) all=true ;; --force) force=true ;; --purge-image) purge=true ;; -h|--help) printf 'Usage: runner-farmctl uninstall <target> [--force] [--purge-image]\n       runner-farmctl uninstall --all [--force] [--purge-image]\n'; return ;; --*) die "Unknown uninstall option: $a" ;; *) [[ -z "$q" ]] || die "Only one target may be specified."; q="$a" ;; esac; done; if [[ "$all" == true ]]; then [[ -z "$q" ]] || die "Do not combine --all with a target."; mapfile -t ids < <(installed_ids); if ((${#ids[@]} == 0)); then log "No runner farms are installed."; return; fi; for id in "${ids[@]}"; do remove_farm_by_id "$id" "$force" "$purge"; done; log "All runner farms were removed. runner-farmctl and saved authentication remain installed."; return; fi; id="$(resolve_target "$q")"; remove_farm_by_id "$id" "$force" "$purge"; }
 
 cmd_auth() { case "${1:-status}" in status) local m t u; m="$(auth_method)"; if t="$(get_token 2>/dev/null)"; then u="$(curl -fsSL -H "Authorization: Bearer $t" https://api.github.com/user | jq -r '.login')"; printf 'Authentication: %s\nUser          : %s\n' "$m" "$u"; else printf 'Authentication: not configured\n'; fi ;; login) auth_login ;; pat) auth_pat ;; logout) rm -f "$AUTH_FILE"; GH_CONFIG_DIR=/root/.config/gh gh auth logout --hostname github.com >/dev/null 2>&1 || true ;; *) die "Usage: auth status|login|pat|logout" ;; esac; }
-
 completion_bash() { cat <<'EOF_BASH'
 _runner_farmctl_complete(){ local cur="${COMP_WORDS[COMP_CWORD]}" cmds="install list status logs scale reconcile sync limits labels image-pull start stop restart config auth completion uninstall manager-uninstall version help"; COMPREPLY=(); if [[ $COMP_CWORD -eq 1 ]]; then COMPREPLY=( $(compgen -W "$cmds" -- "$cur") ); return; fi; case "${COMP_WORDS[1]}" in status|logs|scale|reconcile|sync|limits|labels|image-pull|start|stop|restart|config|uninstall) COMPREPLY=( $(compgen -W "$(runner-farmctl list --ids 2>/dev/null) --all" -- "$cur") ) ;; auth) COMPREPLY=( $(compgen -W "status login pat logout" -- "$cur") ) ;; esac; }
 complete -F _runner_farmctl_complete runner-farmctl
@@ -328,21 +392,9 @@ tui_choose_target(){ local o=() id; while IFS= read -r id; do load_target "$id";
 tui_target(){ local id="$1" a v; while :; do a="$(whiptail --title "$id" --menu "Choose action" 22 82 12 status "View status" scale "Change runner count" limits "Change resources" sync "Synchronize GitHub runners" reconcile "Reconcile workers" logs "Recent logs" restart "Restart" stop "Stop" start "Start" uninstall "Remove farm" back "Back" 3>&1 1>&2 2>&3)" || return; case "$a" in status) tui_show Status cmd_status "$id" ;; scale) v="$(whiptail --inputbox "Runner count" 10 60 3>&1 1>&2 2>&3)" || continue; cmd_scale "$id" "$v" ;; limits) v="$(whiptail --menu "Resource mode" 14 60 4 host "Host/unlimited" custom "Custom" 3>&1 1>&2 2>&3)" || continue; if [[ "$v" == host ]]; then cmd_limits "$id" host; else local c r s; c="$(whiptail --inputbox CPU 10 60 3>&1 1>&2 2>&3)" || continue; r="$(whiptail --inputbox RAM 10 60 3>&1 1>&2 2>&3)" || continue; s="$(whiptail --inputbox Swap 10 60 0 3>&1 1>&2 2>&3)" || continue; cmd_limits "$id" "$c" "$r" "$s"; fi ;; sync) tui_show Sync cmd_sync "$id" ;; reconcile) cmd_reconcile "$id" ;; logs) tui_show Logs journalctl -u "$(service_name "$id")" -n 120 --no-pager ;; restart) cmd_restart "$id" ;; stop) cmd_stop "$id" ;; start) cmd_start "$id" ;; uninstall) whiptail --yesno "Remove this farm?" 10 60 && { cmd_uninstall "$id"; return; } ;; back) return ;; esac; done; }
 cmd_tui(){ ensure_dirs; command -v whiptail >/dev/null 2>&1 || install_base_dependencies; local a id t; while :; do a="$(whiptail --title "GitHub Runner Farm Manager v$MANAGER_VERSION" --menu "Worker image v$IMAGE_VERSION" 20 82 10 farms "Manage installed farms" install "Install repo/org" status "All farm status" auth "Authentication" sync "Sync all" quit "Exit" 3>&1 1>&2 2>&3)" || return; case "$a" in farms) id="$(tui_choose_target)" || { whiptail --msgbox "No farms installed." 8 50; continue; }; tui_target "$id" ;; install) t="$(whiptail --inputbox "Repository or organization" 10 70 3>&1 1>&2 2>&3)" || continue; cmd_install "$t" ;; status) tui_show Status cmd_status ;; auth) tui_show Authentication cmd_auth status ;; sync) tui_show Sync cmd_sync --all ;; quit) return ;; esac; done; }
 
-cmd_manager_uninstall(){
-  case "${1:-}" in
-    "") ;;
-    -h|--help) printf 'Usage: runner-farmctl manager-uninstall\n'; return ;;
-    *) die "Unknown manager-uninstall option: $1" ;;
-  esac
-  [[ "$(target_count)" == 0 ]] || die "Runner farms are still installed. Run 'runner-farmctl uninstall --all' first."
-  rm -f /usr/local/bin/runner-farmctl "$SUPERVISOR_PATH" "$SERVICE_TEMPLATE" /etc/bash_completion.d/runner-farmctl /usr/share/zsh/vendor-completions/_runner-farmctl /usr/share/fish/vendor_completions.d/runner-farmctl.fish
-  rm -rf "$BASE_DIR" "$RUNTIME_DIR"
-  systemctl daemon-reload
-  log "GitHub Runner Farm Manager was uninstalled."
-  log "The GitHub CLI package and its own login state were not removed."
-}
-cmd_self_uninstall(){ warn "self-uninstall is deprecated; use manager-uninstall."; cmd_manager_uninstall; }
+cmd_manager_uninstall(){ case "${1:-}" in "") ;; -h|--help) printf 'Usage: runner-farmctl manager-uninstall\n'; return ;; *) die "Unknown manager-uninstall option: $1" ;; esac; [[ "$(target_count)" == 0 ]] || die "Runner farms are still installed. Run 'runner-farmctl uninstall --all' first."; rm -f /usr/local/bin/runner-farmctl "$SUPERVISOR_PATH" "$SERVICE_TEMPLATE" /etc/bash_completion.d/runner-farmctl /usr/share/zsh/vendor-completions/_runner-farmctl /usr/share/fish/vendor_completions.d/runner-farmctl.fish; rm -rf "$BASE_DIR" "$RUNTIME_DIR"; systemctl daemon-reload; log "GitHub Runner Farm Manager was uninstalled."; log "The GitHub CLI package and its own login state were not removed."; }
+cmd_self_uninstall(){ warn "self-uninstall is deprecated; use manager-uninstall."; cmd_manager_uninstall "$@"; }
 cmd_version(){ printf 'GitHub Runner Farm Manager v%s\nUniversal worker image version v%s\nDefault image: %s\n' "$MANAGER_VERSION" "$IMAGE_VERSION" "$IMAGE_NAME_DEFAULT"; }
 
-main(){ maybe_escalate "$@"; local c="${1:-}"; [[ -n "$c" ]] || { cmd_tui; return; }; shift; case "$c" in install) cmd_install "$@" ;; list) cmd_list "$@" ;; status) cmd_status "$@" ;; logs) cmd_logs "$@" ;; scale) cmd_scale "$@" ;; reconcile) cmd_reconcile "$@" ;; sync) cmd_sync "$@" ;; limits) cmd_limits "$@" ;; labels) cmd_labels "$@" ;; image-pull) cmd_image_pull "$@" ;; start) cmd_start "$@" ;; stop) cmd_stop "$@" ;; restart) cmd_restart "$@" ;; config) cmd_config "$@" ;; auth) cmd_auth "$@" ;; completion) cmd_completion "$@" ;; uninstall) cmd_uninstall "$@" ;; manager-uninstall) cmd_manager_uninstall "$@" ;; self-uninstall) cmd_self_uninstall "$@" ;; version|--version|-V) cmd_version ;; help|--help|-h) usage ;; *) die "Unknown command: $c" ;; esac; }
+main(){ maybe_escalate "$@"; local c="${1:-}"; [[ -n "$c" ]] || { cmd_tui; return; }; shift; case "$c" in install) cmd_install "$@" ;; list|ls) cmd_list "$@" ;; status|st) cmd_status "$@" ;; logs) cmd_logs "$@" ;; scale|sc) cmd_scale "$@" ;; reconcile) cmd_reconcile "$@" ;; sync|sy) cmd_sync "$@" ;; limits|resources) cmd_limits "$@" ;; labels) cmd_labels "$@" ;; image-pull) cmd_image_pull "$@" ;; start) cmd_start "$@" ;; stop) cmd_stop "$@" ;; restart) cmd_restart "$@" ;; config) cmd_config "$@" ;; auth) cmd_auth "$@" ;; completion) cmd_completion "$@" ;; uninstall) cmd_uninstall "$@" ;; manager-uninstall) cmd_manager_uninstall "$@" ;; self-uninstall) cmd_self_uninstall "$@" ;; version|--version|-V) cmd_version ;; help|--help|-h) usage ;; *) die "Unknown command: $c" ;; esac; }
 main "$@"
