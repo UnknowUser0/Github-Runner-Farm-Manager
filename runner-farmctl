@@ -5,7 +5,7 @@ MANAGER_VERSION="1.0.0"
 IMAGE_VERSION="1.0.0"
 MANAGER_REPO="SkyTeamExec/Github-Runner-Farm-Manager"
 MANAGER_REF="${MANAGER_REF:-main}"
-IMAGE_NAME_DEFAULT="ghcr.io/skyteamexec/github-runner-farm-manager:v${IMAGE_VERSION}"
+IMAGE_NAME_DEFAULT="ghcr.io/skyteamexec/github-runner-farm-manager:latest"
 
 BASE_DIR="/etc/github-runner-farm"
 TARGETS_DIR="${BASE_DIR}/targets"
@@ -98,6 +98,8 @@ verify_bootstrap_dependencies() {
     command -v "$cmd" >/dev/null 2>&1 || die "Host dependency '$cmd' is missing. Re-run the bootstrap installer: curl -fsSL https://raw.githubusercontent.com/SkyTeamExec/Github-Runner-Farm-Manager/main/install.sh | sh"
   done
   docker info >/dev/null 2>&1 || die "Docker Engine is unavailable. Re-run the bootstrap installer or ensure 'docker info' succeeds."
+  [[ -x "$SUPERVISOR_PATH" ]] || die "Runner farm supervisor is missing. Re-run the bootstrap installer."
+  [[ -f "$SERVICE_TEMPLATE" ]] || die "Runner farm systemd template is missing. Re-run the bootstrap installer."
 }
 
 physical_cores() {
@@ -181,7 +183,10 @@ resolve_target() { local q="${1:-}" id cfg n; if [[ -z "$q" ]]; then [[ "$(targe
 
 prompt_resources() { local count mode cpu ram swap pc lc mem st; pc="$(physical_cores)"; lc="$(logical_cpus)"; mem="$(host_memory_bytes)"; st="$(host_swap_bytes)"; printf '\nHost resources detected:\n  Physical cores : %s\n  Logical CPUs   : %s\n  RAM            : %s\n  Swap           : %s\n' "$pc" "$lc" "$(bytes_human "$mem")" "$(bytes_human "$st")"; printf 'CPU validation uses physical core topology exposed by Linux, not SMT threads.\n'; read -r -p "Number of runners [4]: " count; count="${count:-4}"; [[ "$count" =~ ^[1-9][0-9]*$ ]] || die "Invalid runner count."; ((count<=64)) || die "Maximum is 64."; INSTALL_RUNNER_COUNT="$count"; printf '\nPer-runner resource mode:\n  1) Host/unlimited (default)\n  2) Custom limits\n'; read -r -p "Choose [1]: " mode; mode="${mode:-1}"; case "$mode" in 1|host|unlimited) INSTALL_CPU=""; INSTALL_MEMORY_BYTES=""; INSTALL_SWAP_BYTES="" ;; 2|custom) read -r -p "CPU cores per runner (max $pc): " cpu; read -r -p "RAM per runner (e.g. 4G): " ram; read -r -p "Swap per runner [0]: " swap; swap="${swap:-0}"; validate_resources "$cpu" "$ram" "$swap"; INSTALL_CPU="$VALID_CPU"; INSTALL_MEMORY_BYTES="$VALID_MEMORY_BYTES"; INSTALL_SWAP_BYTES="$VALID_SWAP_BYTES" ;; *) die "Unknown resource mode." ;; esac; }
 
-install_runtime() { ensure_dirs; local b="https://raw.githubusercontent.com/$MANAGER_REPO/$MANAGER_REF"; curl -fsSL "$b/runner-farm-supervisor" -o "$SUPERVISOR_PATH.tmp"; install -m 0755 "$SUPERVISOR_PATH.tmp" "$SUPERVISOR_PATH"; rm -f "$SUPERVISOR_PATH.tmp"; cat > "$SERVICE_TEMPLATE" <<'EOF_SERVICE'
+install_runtime() {
+  ensure_dirs
+  [[ -x "$SUPERVISOR_PATH" ]] || die "Runner farm supervisor is missing. Re-run the bootstrap installer."
+  cat > "$SERVICE_TEMPLATE" <<'EOF_SERVICE'
 [Unit]
 Description=GitHub Runner Farm (%i)
 After=network-online.target docker.service
@@ -189,6 +194,7 @@ Wants=network-online.target
 Requires=docker.service
 [Service]
 Type=simple
+Environment=id=%i
 ExecStart=/usr/local/libexec/runner-farm-supervisor %i
 Restart=always
 RestartSec=3
@@ -197,7 +203,8 @@ TimeoutStopSec=120
 [Install]
 WantedBy=multi-user.target
 EOF_SERVICE
-systemctl daemon-reload; }
+  systemctl daemon-reload
+}
 
 write_target_config() { local cfg; cfg="$(target_config_path "$TARGET_INSTANCE")"; [[ ! -e "$cfg" ]] || die "Target already installed."; umask 077; cat > "$cfg" <<EOF_CFG
 INSTANCE_ID=$(printf '%q' "$TARGET_INSTANCE")
@@ -228,7 +235,7 @@ EOF_CFG
 chmod 0600 "$cfg"; }
 
 set_target_cfg() { local id="$1" k="$2" v="$3" cfg e; cfg="$(target_config_path "$id")"; e="$(printf '%q' "$v")"; grep -q "^$k=" "$cfg" && sed -i "s|^$k=.*|$k=$e|" "$cfg" || printf '%s=%s\n' "$k" "$e" >> "$cfg"; chmod 0600 "$cfg"; }
-pull_image_for_id() { local id="$1" t u; load_target "$id"; log "Pulling $IMAGE_NAME..."; docker pull "$IMAGE_NAME" && return; t="$(get_token)"; u="$(curl -fsSL -H "Authorization: Bearer $t" https://api.github.com/user | jq -r '.login // empty')"; printf '%s' "$t" | docker login ghcr.io -u "$u" --password-stdin >/dev/null; docker pull "$IMAGE_NAME"; }
+pull_image_for_id() { local id="$1" t u; load_target "$id"; case "${IMAGE_NAME:-}" in ghcr.io/skyteamexec/github-runner-farm-manager:v*) IMAGE_NAME="$IMAGE_NAME_DEFAULT"; set_target_cfg "$id" IMAGE_NAME "$IMAGE_NAME_DEFAULT" ;; esac; log "Pulling $IMAGE_NAME..."; docker pull "$IMAGE_NAME" && return; t="$(get_token)"; u="$(curl -fsSL -H "Authorization: Bearer $t" https://api.github.com/user | jq -r '.login // empty')"; printf '%s' "$t" | docker login ghcr.io -u "$u" --password-stdin >/dev/null; docker pull "$IMAGE_NAME"; }
 service_name() { printf 'github-runner-farm@%s.service' "$1"; }
 wake_service() { systemctl kill -s USR1 "$(service_name "$1")" 2>/dev/null || systemctl restart "$(service_name "$1")"; }
 
