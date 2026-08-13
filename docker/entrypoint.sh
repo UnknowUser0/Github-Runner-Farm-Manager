@@ -25,7 +25,7 @@ prepare_runner() {
   mkdir -p /runner
 
   if [[ -n "$target_version" && -n "$baked_version" && "$target_version" != "$baked_version" ]]; then
-    log "Target GitHub menyediakan runner $target_version; image membawa $baked_version. Mengambil binary target agar kompatibel."
+    log "GitHub exposes runner $target_version for this target; the image contains $baked_version. Downloading the target version for compatibility."
     curl -fsSL "$RUNNER_DOWNLOAD_URL" -o /tmp/actions-runner.tar.gz
     tar -xzf /tmp/actions-runner.tar.gz -C /runner
     rm -f /tmp/actions-runner.tar.gz
@@ -70,7 +70,7 @@ prepare_runner
 mkdir -p /var/lib/docker /var/run
 
 if ! start_docker "$DOCKER_STORAGE_DRIVER"; then
-  log "Docker driver '$DOCKER_STORAGE_DRIVER' gagal; fallback ke vfs."
+  log "Docker storage driver '$DOCKER_STORAGE_DRIVER' failed; falling back to vfs."
   if [[ -n "${DOCKERD_PID:-}" ]]; then
     kill "$DOCKERD_PID" 2>/dev/null || true
     wait "$DOCKERD_PID" 2>/dev/null || true
@@ -103,5 +103,5 @@ export DOCKER_HOST=unix:///var/run/docker.sock
 export RUNNER_TOOL_CACHE=/opt/hostedtoolcache
 export AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
 
-log "Runner online; ephemeral worker akan keluar setelah satu job selesai."
+log "Runner is online. This ephemeral worker exits after one job completes."
 exec runuser -u runner --preserve-environment -- ./run.sh
