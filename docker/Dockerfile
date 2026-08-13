@@ -95,7 +95,7 @@ RUN GO_VERSION="$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1)" \
 # Rust stable + Cargo + rustfmt + clippy.
 RUN mkdir -p /opt/rustup /opt/cargo \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh \
-    && RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo sh /tmp/rustup.sh -y --profile default --default-toolchain stable \
+    && HOME=/root RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo sh /tmp/rustup.sh -y --profile default --default-toolchain stable \
     && rm -f /tmp/rustup.sh \
     && chmod -R a+rX /opt/rustup /opt/cargo
 
@@ -123,11 +123,15 @@ RUN curl -fsSL https://getcomposer.org/installer -o /tmp/composer-setup.php \
     && gem install bundler --no-document
 
 # Android command-line SDK, platform tools, stable API 36 and build tools.
+# Disable pipefail only around license acceptance: sdkmanager can close stdin early,
+# causing `yes` to exit with SIGPIPE (141) even when sdkmanager succeeds.
 RUN mkdir -p /opt/android-sdk/cmdline-tools /tmp/android-cmdline \
     && curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip -o /tmp/android-tools.zip \
     && unzip -q /tmp/android-tools.zip -d /tmp/android-cmdline \
     && mv /tmp/android-cmdline/cmdline-tools /opt/android-sdk/cmdline-tools/latest \
+    && set +o pipefail \
     && yes | /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null \
+    && set -o pipefail \
     && /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager \
          "platform-tools" \
          "platforms;android-36" \
